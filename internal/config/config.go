@@ -87,14 +87,21 @@ type ElasticsearchConfig struct {
 
 // SearchConfig 存储检索阶段增强相关配置。
 type SearchConfig struct {
-	QueryRewriteEnabled      bool   `mapstructure:"query_rewrite_enabled"`
-	QueryRewriteTimeoutS     int    `mapstructure:"query_rewrite_timeout_seconds"`
-	QueryRewriteMaxLength    int    `mapstructure:"query_rewrite_max_length"`
-	RerankEnabled            bool   `mapstructure:"rerank_enabled"`
-	RerankCandidateK         int    `mapstructure:"rerank_candidate_k"`
-	ExternalRerankerEnabled  bool   `mapstructure:"external_reranker_enabled"`
-	ExternalRerankerURL      string `mapstructure:"external_reranker_url"`
-	ExternalRerankerTimeoutS int    `mapstructure:"external_reranker_timeout_seconds"`
+	QueryRewriteEnabled          bool   `mapstructure:"query_rewrite_enabled"`
+	QueryRewriteTimeoutS         int    `mapstructure:"query_rewrite_timeout_seconds"`
+	QueryRewriteMaxLength        int    `mapstructure:"query_rewrite_max_length"`
+	EmbeddingCacheEnabled        bool   `mapstructure:"embedding_cache_enabled"`
+	EmbeddingCacheTTLSeconds     int    `mapstructure:"embedding_cache_ttl_seconds"`
+	ResultCacheEnabled           bool   `mapstructure:"result_cache_enabled"`
+	ResultCacheTTLSeconds        int    `mapstructure:"result_cache_ttl_seconds"`
+	ResultCacheSimilarityEnabled bool   `mapstructure:"result_cache_similarity_enabled"`
+	RerankEnabled                bool   `mapstructure:"rerank_enabled"`
+	RerankCandidateK             int    `mapstructure:"rerank_candidate_k"`
+	ExternalRerankerEnabled      bool   `mapstructure:"external_reranker_enabled"`
+	ExternalRerankerURL          string `mapstructure:"external_reranker_url"`
+	ExternalRerankerTimeoutS     int    `mapstructure:"external_reranker_timeout_seconds"`
+	ExternalRerankerAPIKey       string `mapstructure:"external_reranker_api_key"`
+	ExternalRerankerModel        string `mapstructure:"external_reranker_model"`
 }
 
 // MemoryConfig 存储记忆检索/衰减/清理相关配置。

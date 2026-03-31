@@ -2,10 +2,10 @@
 package repository
 
 import (
+	"WeaveKnow/internal/model"
 	"context"
 	"github.com/go-redis/redis/v8"
 	"gorm.io/gorm"
-	"pai-smart-go/internal/model"
 	"strconv"
 )
 

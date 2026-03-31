@@ -1,10 +1,10 @@
 package repository
 
 import (
+	"WeaveKnow/internal/model"
 	"context"
 	"errors"
 	"fmt"
-	"pai-smart-go/internal/model"
 
 	"gorm.io/gorm"
 )

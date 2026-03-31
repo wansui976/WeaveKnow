@@ -2,9 +2,9 @@
 package storage
 
 import (
+	"WeaveKnow/internal/config"
+	"WeaveKnow/pkg/log"
 	"context"
-	"pai-smart-go/internal/config"
-	"pai-smart-go/pkg/log"
 	"time"
 
 	"github.com/minio/minio-go/v7"

@@ -1,10 +1,10 @@
 package handler
 
 import (
+	"WeaveKnow/internal/model"
+	"WeaveKnow/internal/service"
+	"WeaveKnow/pkg/log"
 	"net/http"
-	"pai-smart-go/internal/model"
-	"pai-smart-go/internal/service"
-	"pai-smart-go/pkg/log"
 	"strconv"
 
 	"github.com/gin-gonic/gin"

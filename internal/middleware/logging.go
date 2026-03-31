@@ -2,12 +2,12 @@
 package middleware
 
 import (
+	"WeaveKnow/pkg/log"
 	"bytes"
 	"github.com/gin-gonic/gin"
 	"io/ioutil"
 	"mime"
 	"net/http"
-	"pai-smart-go/pkg/log"
 	"time"
 	"unicode/utf8"
 )

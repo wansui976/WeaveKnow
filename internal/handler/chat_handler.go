@@ -2,12 +2,12 @@
 package handler
 
 import (
+	"WeaveKnow/internal/service"
+	"WeaveKnow/pkg/log"
+	"WeaveKnow/pkg/token"
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"pai-smart-go/internal/service"
-	"pai-smart-go/pkg/log"
-	"pai-smart-go/pkg/token"
 	"sync"
 	"time"
 

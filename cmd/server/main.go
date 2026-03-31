@@ -2,6 +2,22 @@
 package main
 
 import (
+	"WeaveKnow/internal/config"
+	"WeaveKnow/internal/handler"
+	"WeaveKnow/internal/middleware"
+	"WeaveKnow/internal/pipeline"
+	"WeaveKnow/internal/repository"
+	"WeaveKnow/internal/service"
+	"WeaveKnow/pkg/database"
+	"WeaveKnow/pkg/embedding"
+	"WeaveKnow/pkg/es"
+	"WeaveKnow/pkg/kafka"
+	"WeaveKnow/pkg/llm"
+	"WeaveKnow/pkg/log"
+	"WeaveKnow/pkg/reranker"
+	"WeaveKnow/pkg/storage"
+	"WeaveKnow/pkg/tika"
+	"WeaveKnow/pkg/token"
 	"bytes"
 	"context"
 	"crypto/md5"
@@ -11,22 +27,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"pai-smart-go/internal/config"
-	"pai-smart-go/internal/handler"
-	"pai-smart-go/internal/middleware"
-	"pai-smart-go/internal/pipeline"
-	"pai-smart-go/internal/repository"
-	"pai-smart-go/internal/service"
-	"pai-smart-go/pkg/database"
-	"pai-smart-go/pkg/embedding"
-	"pai-smart-go/pkg/es"
-	"pai-smart-go/pkg/kafka"
-	"pai-smart-go/pkg/llm"
-	"pai-smart-go/pkg/log"
-	"pai-smart-go/pkg/reranker"
-	"pai-smart-go/pkg/storage"
-	"pai-smart-go/pkg/tika"
-	"pai-smart-go/pkg/token"
 	"path/filepath"
 	"syscall"
 	"time"
@@ -74,6 +74,8 @@ func main() {
 		rerankerClient = reranker.NewClient(reranker.Options{
 			Endpoint: cfg.Search.ExternalRerankerURL,
 			Timeout:  time.Duration(cfg.Search.ExternalRerankerTimeoutS) * time.Second,
+			APIKey:   cfg.Search.ExternalRerankerAPIKey,
+			Model:    cfg.Search.ExternalRerankerModel,
 		})
 	}
 	userService := service.NewUserService(userRepository, orgTagRepo, jwtManager)
@@ -93,16 +95,16 @@ func main() {
 	)
 	memoryService := service.NewMemoryService(memoryRepo, cfg.Memory)
 	conversationService := service.NewConversationService(conversationRepo)
-	agentService := service.NewAgentService(
+	agentService := service.NewEnhancedAgentService(
 		searchService,
 		llmClient,
 		conversationRepo,
 		metricsService,
 		service.AgentOptions{
-			MaxIterations:           cfg.AI.Agent.MaxIterations,
-			DefaultTopK:             cfg.AI.Agent.DefaultTopK,
-			ToolTimeout:             time.Duration(cfg.AI.Agent.ToolTimeoutS) * time.Second,
-			ToolContextBudgetTokens: cfg.AI.Agent.ToolContextBudgetTokens,
+			MaxIterations:           4,
+			DefaultTopK:             5,
+			ToolTimeout:             8 * time.Second,
+			ToolContextBudgetTokens: 1200,
 		},
 	)
 	chatService := service.NewChatService(searchService, memoryService, metricsService, llmClient, conversationRepo, agentService)

@@ -2,6 +2,7 @@
 package llm
 
 import (
+	"WeaveKnow/internal/config"
 	"bufio"
 	"bytes"
 	"context"
@@ -9,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"pai-smart-go/internal/config"
 	"strings"
 
 	"github.com/gorilla/websocket"

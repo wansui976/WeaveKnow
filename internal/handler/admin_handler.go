@@ -2,10 +2,10 @@
 package handler
 
 import (
+	"WeaveKnow/internal/service"
+	"WeaveKnow/pkg/log"
+	"WeaveKnow/pkg/token"
 	"net/http"
-	"pai-smart-go/internal/service"
-	"pai-smart-go/pkg/log"
-	"pai-smart-go/pkg/token"
 	"strconv"
 	"time"
 

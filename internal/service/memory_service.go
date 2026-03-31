@@ -1,14 +1,14 @@
 package service
 
 import (
+	"WeaveKnow/internal/config"
+	"WeaveKnow/internal/model"
+	"WeaveKnow/internal/repository"
+	"WeaveKnow/pkg/log"
 	"context"
 	"crypto/md5"
 	"fmt"
 	"math"
-	"pai-smart-go/internal/config"
-	"pai-smart-go/internal/model"
-	"pai-smart-go/internal/repository"
-	"pai-smart-go/pkg/log"
 	"regexp"
 	"sort"
 	"strings"

@@ -2,6 +2,9 @@
 package es
 
 import (
+	"WeaveKnow/internal/config"
+	"WeaveKnow/internal/model"
+	"WeaveKnow/pkg/log"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -10,9 +13,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"pai-smart-go/internal/config"
-	"pai-smart-go/internal/model"
-	"pai-smart-go/pkg/log"
 	"strings"
 
 	"github.com/elastic/go-elasticsearch/v8"

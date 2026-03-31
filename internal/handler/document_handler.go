@@ -2,14 +2,14 @@
 package handler
 
 import (
+	"WeaveKnow/internal/model"
+	"WeaveKnow/internal/service"
+	"WeaveKnow/pkg/log"
+	"WeaveKnow/pkg/token"
 	"github.com/gin-gonic/gin"
 	"io"
 	"net/http"
 	"net/url"
-	"pai-smart-go/internal/model"
-	"pai-smart-go/internal/service"
-	"pai-smart-go/pkg/log"
-	"pai-smart-go/pkg/token"
 	"strconv"
 )
 

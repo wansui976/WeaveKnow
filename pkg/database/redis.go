@@ -1,9 +1,9 @@
 package database
 
 import (
+	"WeaveKnow/pkg/log"
 	"context"
 	"github.com/go-redis/redis/v8"
-	"pai-smart-go/pkg/log"
 )
 
 var RDB *redis.Client

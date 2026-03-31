@@ -2,8 +2,8 @@
 package repository
 
 import (
+	"WeaveKnow/internal/model"
 	"gorm.io/gorm"
-	"pai-smart-go/internal/model"
 )
 
 // UserRepository 接口定义了用户数据的持久化操作。

@@ -2,9 +2,9 @@
 package middleware
 
 import (
+	"WeaveKnow/internal/model"
 	"github.com/gin-gonic/gin"
 	"net/http"
-	"pai-smart-go/internal/model"
 )
 
 // AdminAuthMiddleware 检查用户是否具有管理员权限。

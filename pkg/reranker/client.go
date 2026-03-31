@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"os"
 	"strings"
 	"time"
 )
@@ -32,11 +34,15 @@ type Options struct {
 	Endpoint string
 	Timeout  time.Duration
 	APIKey   string
+	// Model 仅在 Jina 接口下生效；为空时会使用默认值。
+	Model string
 }
 
 type httpClient struct {
 	endpoint string
 	apiKey   string
+	model    string
+	isJina   bool
 	client   *http.Client
 }
 
@@ -45,9 +51,28 @@ func NewClient(opts Options) Client {
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
+	endpoint := strings.TrimSpace(opts.Endpoint)
+	isJina := isJinaEndpoint(endpoint)
+
+	apiKey := strings.TrimSpace(opts.APIKey)
+	if apiKey == "" && isJina {
+		apiKey = strings.TrimSpace(os.Getenv("JINA_API_KEY"))
+	}
+
+	model := strings.TrimSpace(opts.Model)
+	if model == "" && isJina {
+		model = strings.TrimSpace(os.Getenv("JINA_RERANK_MODEL"))
+	}
+	if model == "" && isJina {
+		// 多语种默认模型，中文可直接使用。
+		model = "jina-reranker-v2-base-multilingual"
+	}
+
 	return &httpClient{
-		endpoint: strings.TrimSpace(opts.Endpoint),
-		apiKey:   strings.TrimSpace(opts.APIKey),
+		endpoint: endpoint,
+		apiKey:   apiKey,
+		model:    model,
+		isJina:   isJina,
 		client:   &http.Client{Timeout: timeout},
 	}
 }
@@ -66,6 +91,14 @@ func (c *httpClient) Rerank(ctx context.Context, query string, docs []Document, 
 		topK = len(docs)
 	}
 
+	if c.isJina {
+		return c.rerankJina(ctx, query, docs, topK)
+	}
+
+	return c.rerankGeneric(ctx, query, docs, topK)
+}
+
+func (c *httpClient) rerankGeneric(ctx context.Context, query string, docs []Document, topK int) ([]Result, error) {
 	reqBody := map[string]interface{}{
 		"query":     query,
 		"documents": docs,
@@ -108,4 +141,78 @@ func (c *httpClient) Rerank(ctx context.Context, query string, docs []Document, 
 		return parsed.Results, nil
 	}
 	return parsed.Data, nil
+}
+
+func (c *httpClient) rerankJina(ctx context.Context, query string, docs []Document, topK int) ([]Result, error) {
+	// Jina 文档可直接传字符串数组；返回结果中的 index 就是输入顺序位置。
+	docTexts := make([]string, 0, len(docs))
+	for _, d := range docs {
+		docTexts = append(docTexts, d.Text)
+	}
+
+	reqBody := map[string]interface{}{
+		"model":     c.model,
+		"query":     query,
+		"documents": docTexts,
+		"top_n":     topK,
+		// 仅需排序结果，减少响应体大小。
+		"return_documents": false,
+	}
+
+	bodyBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("marshal jina rerank request failed: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return nil, fmt.Errorf("create jina rerank request failed: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if c.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("call jina rerank service failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("jina rerank returned status=%s, body=%s", resp.Status, string(raw))
+	}
+
+	var parsed struct {
+		Results []struct {
+			Index          int     `json:"index"`
+			RelevanceScore float64 `json:"relevance_score"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return nil, fmt.Errorf("decode jina rerank response failed: %w", err)
+	}
+
+	out := make([]Result, 0, len(parsed.Results))
+	for _, r := range parsed.Results {
+		out = append(out, Result{
+			ID:    r.Index,
+			Score: r.RelevanceScore,
+		})
+	}
+	return out, nil
+}
+
+func isJinaEndpoint(endpoint string) bool {
+	u, err := url.Parse(strings.TrimSpace(endpoint))
+	if err != nil {
+		return strings.Contains(strings.ToLower(endpoint), "jina.ai")
+	}
+
+	host := strings.ToLower(u.Hostname())
+	if strings.Contains(host, "jina.ai") {
+		return true
+	}
+	return strings.Contains(strings.ToLower(u.Path), "/v1/rerank")
 }

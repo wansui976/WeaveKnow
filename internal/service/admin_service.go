@@ -2,11 +2,11 @@
 package service
 
 import (
+	"WeaveKnow/internal/model"
+	"WeaveKnow/internal/repository"
 	"context"
 	"errors"
 	"fmt"
-	"pai-smart-go/internal/model"
-	"pai-smart-go/internal/repository"
 	"strings"
 	"time"
 

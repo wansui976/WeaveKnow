@@ -2,10 +2,10 @@
 package repository
 
 import (
+	"WeaveKnow/internal/model"
 	"context"
 	"encoding/json"
 	"fmt"
-	"pai-smart-go/internal/model"
 	"time"
 
 	"github.com/go-redis/redis/v8"

@@ -1,7 +1,7 @@
 package service
 
 import (
-	"pai-smart-go/internal/model"
+	"WeaveKnow/internal/model"
 	"strings"
 )
 

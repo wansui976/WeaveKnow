@@ -2,13 +2,13 @@
 package embedding
 
 import (
+	"WeaveKnow/internal/config"
+	"WeaveKnow/pkg/log"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"pai-smart-go/internal/config"
-	"pai-smart-go/pkg/log"
 )
 
 // Client defines the interface for an embedding client.

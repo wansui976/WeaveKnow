@@ -1,8 +1,8 @@
 package handler
 
 import (
+	"WeaveKnow/internal/service"
 	"net/http"
-	"pai-smart-go/internal/service"
 
 	"github.com/gin-gonic/gin"
 )

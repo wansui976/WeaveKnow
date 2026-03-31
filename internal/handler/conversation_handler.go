@@ -2,10 +2,10 @@
 package handler
 
 import (
+	"WeaveKnow/internal/service"
+	"WeaveKnow/pkg/token"
 	"github.com/gin-gonic/gin"
 	"net/http"
-	"pai-smart-go/internal/service"
-	"pai-smart-go/pkg/token"
 )
 
 // ConversationHandler 处理与对话相关的 API 请求。

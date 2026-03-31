@@ -2,9 +2,9 @@
 package service
 
 import (
+	"WeaveKnow/internal/model"
+	"WeaveKnow/internal/repository"
 	"context"
-	"pai-smart-go/internal/model"
-	"pai-smart-go/internal/repository"
 )
 
 // ConversationService 定义了对话业务逻辑的接口。

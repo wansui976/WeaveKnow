@@ -1,8 +1,8 @@
 package repository
 
 import (
+	"WeaveKnow/internal/model"
 	"gorm.io/gorm"
-	"pai-smart-go/internal/model"
 )
 
 // DocumentVectorRepository 定义了对 document_vectors 表的数据操作接口。

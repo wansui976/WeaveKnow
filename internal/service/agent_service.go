@@ -2,16 +2,16 @@
 package service
 
 import (
+	"WeaveKnow/internal/config"
+	"WeaveKnow/internal/model"
+	"WeaveKnow/internal/repository"
+	"WeaveKnow/pkg/llm"
+	"WeaveKnow/pkg/log"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
-	"pai-smart-go/internal/config"
-	"pai-smart-go/internal/model"
-	"pai-smart-go/internal/repository"
-	"pai-smart-go/pkg/llm"
-	"pai-smart-go/pkg/log"
 	"sort"
 	"strings"
 	"time"

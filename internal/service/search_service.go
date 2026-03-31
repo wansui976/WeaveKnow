@@ -2,27 +2,32 @@
 package service
 
 import (
+	"WeaveKnow/internal/config"
+	"WeaveKnow/internal/model"
+	"WeaveKnow/internal/repository"
+	"WeaveKnow/pkg/database"
+	"WeaveKnow/pkg/embedding"
+	"WeaveKnow/pkg/llm"
+	"WeaveKnow/pkg/log"
+	"WeaveKnow/pkg/reranker"
 	"bytes"
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"math"
-	"pai-smart-go/internal/config"
-	"pai-smart-go/internal/model"
-	"pai-smart-go/internal/repository"
-	"pai-smart-go/pkg/embedding"
-	"pai-smart-go/pkg/llm"
-	"pai-smart-go/pkg/log"
-	"pai-smart-go/pkg/reranker"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
 	"github.com/elastic/go-elasticsearch/v8"
+	redis "github.com/go-redis/redis/v8"
 )
 
 // 包级变量，避免每次调用 normalizeQuery 时重复编译正则
@@ -115,9 +120,20 @@ func (s *searchService) HybridSearch(ctx context.Context, query string, topK int
 		log.Infof("[SearchService] 规范化查询: '%s' -> normalized='%s', phrase='%s'", rewrittenQuery, normalized, phrase)
 	}
 
+	// 2.1) 检索结果缓存（支持相似 query 复用）。
+	// 命中时可直接跳过 embedding + ES 双路召回。
+	resultCacheKey := ""
+	if s.isResultCacheEnabled() {
+		resultCacheKey = s.buildResultCacheKey(user, userEffectiveTags, rewrittenQuery, normalized, phrase, topK)
+		if cached, hit := s.getResultCache(ctx, resultCacheKey); hit {
+			log.Infof("[SearchService] 检索结果缓存命中, key=%s, size=%d", resultCacheKey, len(cached))
+			return cached, nil
+		}
+	}
+
 	// 3) 使用改写后的 query（非 normalized）生成查询向量，最大保留语义信息。
 	log.Info("[SearchService] 步骤2: 开始向量化查询")
-	queryVector, err := s.embeddingClient.CreateEmbedding(ctx, rewrittenQuery)
+	queryVector, err := s.getQueryEmbeddingWithCache(ctx, rewrittenQuery)
 	if err != nil {
 		log.Errorf("[SearchService] 向量化查询失败: %v", err)
 		return nil, fmt.Errorf("failed to create query embedding: %w", err)
@@ -142,13 +158,17 @@ func (s *searchService) HybridSearch(ctx context.Context, query string, topK int
 		if err != nil {
 			// 重试失败记录 Warn，不中断主流程，返回空结果。
 			log.Warnf("[SearchService] 降级重试失败: %v", err)
-			return []model.SearchResponseDTO{}, nil
+			empty := []model.SearchResponseDTO{}
+			s.setResultCache(ctx, resultCacheKey, empty)
+			return empty, nil
 		}
 		log.Infof("[SearchService] 重试后命中 %d 条", len(results))
 	}
 
 	if len(results) == 0 {
-		return []model.SearchResponseDTO{}, nil
+		empty := []model.SearchResponseDTO{}
+		s.setResultCache(ctx, resultCacheKey, empty)
+		return empty, nil
 	}
 
 	// 6) 批量补齐文件名（ES 命中里只有 file_md5，需回表查询）。
@@ -185,6 +205,8 @@ func (s *searchService) HybridSearch(ctx context.Context, query string, topK int
 	} else if len(dtos) > topK && topK > 0 {
 		dtos = dtos[:topK]
 	}
+
+	s.setResultCache(ctx, resultCacheKey, dtos)
 
 	log.Infof("[SearchService] 混合搜索完毕, 返回 %d 条结果, query: '%s'", len(dtos), rewrittenQuery)
 	return dtos, nil
@@ -295,6 +317,11 @@ type esHit struct {
 
 const defaultRRFConstant = 60.0
 
+const (
+	defaultEmbeddingCacheTTLSeconds = 6 * 60 * 60
+	defaultResultCacheTTLSeconds    = 90
+)
+
 // execHybridSearch 兼容 ES 8.10：分别执行 kNN 与 BM25 检索，然后在 Go 内存中用 RRF 融合。
 func (s *searchService) execHybridSearch(
 	ctx context.Context,
@@ -306,15 +333,59 @@ func (s *searchService) execHybridSearch(
 	orgTags []string,
 ) ([]esHit, error) {
 	knnQuery := buildKNNQuery(queryVector, topK, user, orgTags)
-	knnHits, err := s.execSearch(ctx, knnQuery)
-	if err != nil {
-		return nil, err
-	}
-
 	bm25Query := buildBM25Query(normalized, phrase, topK, user, orgTags)
-	bm25Hits, err := s.execSearch(ctx, bm25Query)
-	if err != nil {
-		return nil, err
+
+	// 两路召回并行执行，减少串行等待时间。
+	// 任一路失败都会 cancel 另一条正在进行的检索请求。
+	searchCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var (
+		knnHits  []esHit
+		bm25Hits []esHit
+		knnErr   error
+		bm25Err  error
+		wg       sync.WaitGroup
+		mu       sync.Mutex
+	)
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		hits, err := s.execSearch(searchCtx, knnQuery)
+		if err != nil {
+			mu.Lock()
+			knnErr = fmt.Errorf("kNN search failed: %w", err)
+			mu.Unlock()
+			cancel()
+			return
+		}
+		mu.Lock()
+		knnHits = hits
+		mu.Unlock()
+	}()
+
+	go func() {
+		defer wg.Done()
+		hits, err := s.execSearch(searchCtx, bm25Query)
+		if err != nil {
+			mu.Lock()
+			bm25Err = fmt.Errorf("BM25 search failed: %w", err)
+			mu.Unlock()
+			cancel()
+			return
+		}
+		mu.Lock()
+		bm25Hits = hits
+		mu.Unlock()
+	}()
+
+	wg.Wait()
+	if knnErr != nil {
+		return nil, knnErr
+	}
+	if bm25Err != nil {
+		return nil, bm25Err
 	}
 
 	return fuseRRFHits(knnHits, bm25Hits, topK, defaultRRFConstant), nil
@@ -364,6 +435,184 @@ func (s *searchService) execSearch(ctx context.Context, esQuery map[string]inter
 		hits = append(hits, esHit{Source: h.Source, Score: h.Score})
 	}
 	return hits, nil
+}
+
+// getQueryEmbeddingWithCache 优先从 Redis 读取 query 向量，未命中再调用 embedding API。
+func (s *searchService) getQueryEmbeddingWithCache(ctx context.Context, query string) ([]float32, error) {
+	if !s.isEmbeddingCacheEnabled() {
+		return s.embeddingClient.CreateEmbedding(ctx, query)
+	}
+	rdb := database.RDB
+	if rdb == nil {
+		return s.embeddingClient.CreateEmbedding(ctx, query)
+	}
+
+	key := s.buildEmbeddingCacheKey(query)
+	raw, err := rdb.Get(ctx, key).Bytes()
+	if err == nil {
+		var cached []float32
+		if unmarshalErr := json.Unmarshal(raw, &cached); unmarshalErr == nil && len(cached) > 0 {
+			log.Debugf("[SearchService] embedding 缓存命中, key=%s, dims=%d", key, len(cached))
+			return cached, nil
+		}
+		_ = rdb.Del(ctx, key).Err()
+	} else if err != redis.Nil {
+		log.Warnf("[SearchService] 读取 embedding 缓存失败: %v", err)
+	}
+
+	embeddingVec, err := s.embeddingClient.CreateEmbedding(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	if len(embeddingVec) == 0 {
+		return embeddingVec, nil
+	}
+
+	buf, marshalErr := json.Marshal(embeddingVec)
+	if marshalErr != nil {
+		return embeddingVec, nil
+	}
+	if setErr := rdb.Set(ctx, key, buf, s.embeddingCacheTTL()).Err(); setErr != nil {
+		log.Warnf("[SearchService] 写入 embedding 缓存失败: %v", setErr)
+	}
+	return embeddingVec, nil
+}
+
+func (s *searchService) buildEmbeddingCacheKey(query string) string {
+	base := strings.TrimSpace(query)
+	model := strings.TrimSpace(config.Conf.Embedding.Model)
+	return fmt.Sprintf("search:emb:v1:%s:%d:%s", model, config.Conf.Embedding.Dimensions, shortHash(base))
+}
+
+func (s *searchService) isEmbeddingCacheEnabled() bool {
+	return s.searchCfg.EmbeddingCacheEnabled
+}
+
+func (s *searchService) embeddingCacheTTL() time.Duration {
+	ttl := s.searchCfg.EmbeddingCacheTTLSeconds
+	if ttl <= 0 {
+		ttl = defaultEmbeddingCacheTTLSeconds
+	}
+	return time.Duration(ttl) * time.Second
+}
+
+func (s *searchService) isResultCacheEnabled() bool {
+	return s.searchCfg.ResultCacheEnabled
+}
+
+func (s *searchService) resultCacheTTL() time.Duration {
+	ttl := s.searchCfg.ResultCacheTTLSeconds
+	if ttl <= 0 {
+		ttl = defaultResultCacheTTLSeconds
+	}
+	return time.Duration(ttl) * time.Second
+}
+
+// buildResultCacheKey 生成检索结果缓存键。
+//
+// 键由索引、用户、权限范围（组织标签）、查询语义、返回条数及重排配置组成，
+// 并对可变长字段做短哈希，避免键过长且降低不同请求间的碰撞风险。
+func (s *searchService) buildResultCacheKey(
+	user *model.User,
+	orgTags []string,
+	rewrittenQuery string,
+	normalized string,
+	phrase string,
+	topK int,
+) string {
+	// 兜底默认分页大小，避免 0/负值导致缓存键不稳定。
+	if topK <= 0 {
+		topK = 10
+	}
+
+	// 默认使用改写后的查询文本作为查询签名。
+	queryKey := strings.ToLower(strings.TrimSpace(rewrittenQuery))
+	// 启用“相似查询共用缓存”时，优先使用 normalized/phrase 作为语义键。
+	if s.searchCfg.ResultCacheSimilarityEnabled {
+		parts := make([]string, 0, 2)
+		if normalized != "" {
+			parts = append(parts, normalized)
+		}
+		if phrase != "" && phrase != normalized {
+			parts = append(parts, phrase)
+		}
+		if len(parts) > 0 {
+			queryKey = strings.Join(parts, "|")
+		}
+	}
+
+	// 组织标签排序后再拼接，确保入参顺序不同但语义一致时命中同一缓存。
+	sortedTags := append([]string(nil), orgTags...)
+	sort.Strings(sortedTags)
+	scopeSig := strings.Join(sortedTags, ",")
+
+	// 重排配置纳入签名，避免不同重排策略复用同一缓存结果。
+	rerankSig := "off"
+	if s.searchCfg.RerankEnabled {
+		rerankSig = "local"
+		if s.searchCfg.ExternalRerankerEnabled {
+			rerankSig = "ext:" + s.searchCfg.ExternalRerankerURL + ":" + s.searchCfg.ExternalRerankerModel
+		}
+	}
+
+	// 统一缓存键格式；长文本字段使用 shortHash 控制长度并提升可读性。
+	return fmt.Sprintf(
+		"search:result:v1:%s:u%d:o%s:q%s:k%d:r%s",
+		s.indexName,
+		user.ID,
+		shortHash(scopeSig),
+		shortHash(queryKey),
+		topK,
+		shortHash(rerankSig),
+	)
+}
+
+func (s *searchService) getResultCache(ctx context.Context, key string) ([]model.SearchResponseDTO, bool) {
+	if !s.isResultCacheEnabled() || key == "" {
+		return nil, false
+	}
+	rdb := database.RDB
+	if rdb == nil {
+		return nil, false
+	}
+
+	raw, err := rdb.Get(ctx, key).Bytes()
+	if err != nil {
+		if err != redis.Nil {
+			log.Warnf("[SearchService] 读取检索缓存失败: %v", err)
+		}
+		return nil, false
+	}
+
+	var cached []model.SearchResponseDTO
+	if err := json.Unmarshal(raw, &cached); err != nil {
+		_ = rdb.Del(ctx, key).Err()
+		return nil, false
+	}
+	return cached, true
+}
+
+func (s *searchService) setResultCache(ctx context.Context, key string, dtos []model.SearchResponseDTO) {
+	if !s.isResultCacheEnabled() || key == "" {
+		return
+	}
+	rdb := database.RDB
+	if rdb == nil {
+		return
+	}
+
+	payload, err := json.Marshal(dtos)
+	if err != nil {
+		return
+	}
+	if err := rdb.Set(ctx, key, payload, s.resultCacheTTL()).Err(); err != nil {
+		log.Warnf("[SearchService] 写入检索缓存失败: %v", err)
+	}
+}
+
+func shortHash(input string) string {
+	sum := sha1.Sum([]byte(input))
+	return hex.EncodeToString(sum[:8])
 }
 
 // fuseRRFHits 使用 Reciprocal Rank Fusion 融合两路结果。

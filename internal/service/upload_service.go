@@ -2,18 +2,18 @@
 package service
 
 import (
+	"WeaveKnow/internal/config"
+	"WeaveKnow/internal/model"
+	"WeaveKnow/internal/repository"
+	"WeaveKnow/pkg/kafka"
+	"WeaveKnow/pkg/log"
+	"WeaveKnow/pkg/storage"
+	"WeaveKnow/pkg/tasks"
 	"context"
 	"errors"
 	"fmt"
 	"math"
 	"mime/multipart"
-	"pai-smart-go/internal/config"
-	"pai-smart-go/internal/model"
-	"pai-smart-go/internal/repository"
-	"pai-smart-go/pkg/kafka"
-	"pai-smart-go/pkg/log"
-	"pai-smart-go/pkg/storage"
-	"pai-smart-go/pkg/tasks"
 	"strings"
 
 	"github.com/minio/minio-go/v7"

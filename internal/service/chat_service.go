@@ -2,16 +2,16 @@
 package service
 
 import (
+	"WeaveKnow/internal/config"
+	"WeaveKnow/internal/model"
+	"WeaveKnow/internal/repository"
+	"WeaveKnow/pkg/llm"
+	"WeaveKnow/pkg/log"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"net/url"
-	"pai-smart-go/internal/config"
-	"pai-smart-go/internal/model"
-	"pai-smart-go/internal/repository"
-	"pai-smart-go/pkg/llm"
-	"pai-smart-go/pkg/log"
 	"strings"
 	"sync"
 	"time"
@@ -502,7 +502,7 @@ func (s *chatService) composeMessages(systemMsg string, history []model.ChatMess
 
 // addMessageToConversation 将本轮 Q&A 追加到对话历史。
 //
-// 🟠 Fix #5: 若底层 Repository 支持 AppendMessages，应优先使用 Append-only 接口
+// 若底层 Repository 支持 AppendMessages，应优先使用 Append-only 接口
 // 以避免"读-改-写"模式在并发下覆盖其他请求写入的消息。
 // 当前实现保持与原接口兼容，但标注了改造方向。
 func (s *chatService) addMessageToConversation(ctx context.Context, userID uint, question, answer string) error {

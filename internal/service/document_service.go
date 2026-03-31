@@ -2,21 +2,21 @@
 package service
 
 import (
+	"WeaveKnow/internal/config"
+	"WeaveKnow/internal/model"
+	"WeaveKnow/internal/repository"
+	"WeaveKnow/pkg/storage"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"mime"
 	"net/url"
-	"pai-smart-go/internal/config"
-	"pai-smart-go/internal/model"
-	"pai-smart-go/internal/repository"
-	"pai-smart-go/pkg/storage"
 	"path/filepath"
 	"strings"
 
+	"WeaveKnow/pkg/tika"
 	"github.com/minio/minio-go/v7"
-	"pai-smart-go/pkg/tika"
 )
 
 // FileUploadDTO 是一个数据传输对象，用于在返回给前端时隐藏一些字段并添加额外信息。

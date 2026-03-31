@@ -2,12 +2,12 @@
 package tika
 
 import (
+	"WeaveKnow/internal/config"
 	"bytes"
 	"fmt"
 	"io"
 	"mime"
 	"net/http"
-	"pai-smart-go/internal/config"
 	"path/filepath"
 )
 

@@ -169,6 +169,9 @@ services:
       TZ: Asia/Shanghai
       NO_PROXY: localhost,127.0.0.1,minio,backend,mysql,redis,es,kafka,zookeeper,tika
       no_proxy: localhost,127.0.0.1,minio,backend,mysql,redis,es,kafka,zookeeper,tika
+      # Jina Rerank API（可在 .env 或 shell 中注入）
+      JINA_API_KEY: ${JINA_API_KEY:-}
+      JINA_RERANK_MODEL: ${JINA_RERANK_MODEL:-jina-reranker-v2-base-multilingual}
     volumes:
       - ../deployments/config.docker.yaml:/app/configs/config.yaml:ro
       - ../logs:/app/logs

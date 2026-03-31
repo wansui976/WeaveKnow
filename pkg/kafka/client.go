@@ -2,13 +2,13 @@
 package kafka
 
 import (
+	"WeaveKnow/internal/config"
+	"WeaveKnow/pkg/database"
+	"WeaveKnow/pkg/log"
+	"WeaveKnow/pkg/tasks"
 	"context"
 	"encoding/json"
 	"fmt"
-	"pai-smart-go/internal/config"
-	"pai-smart-go/pkg/database"
-	"pai-smart-go/pkg/log"
-	"pai-smart-go/pkg/tasks"
 	"time"
 
 	"github.com/segmentio/kafka-go"
@@ -52,7 +52,7 @@ func StartConsumer(cfg config.KafkaConfig, processor TaskProcessor) {
 	r := kafka.NewReader(kafka.ReaderConfig{
 		Brokers:  []string{cfg.Brokers},
 		Topic:    cfg.Topic,
-		GroupID:  "pai-smart-go-consumer",
+		GroupID:  "WeaveKnow-consumer",
 		MinBytes: 10e3, // 10KB
 		MaxBytes: 10e6, // 10MB
 	})

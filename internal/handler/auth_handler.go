@@ -2,10 +2,10 @@
 package handler
 
 import (
+	"WeaveKnow/internal/service"
+	"WeaveKnow/pkg/log"
 	"github.com/gin-gonic/gin"
 	"net/http"
-	"pai-smart-go/internal/service"
-	"pai-smart-go/pkg/log"
 )
 
 // AuthHandler 负责处理认证相关的 API 请求，例如刷新 token。

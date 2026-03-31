@@ -2,15 +2,15 @@
 package service
 
 import (
+	"WeaveKnow/internal/model"
+	"WeaveKnow/internal/repository"
+	"WeaveKnow/pkg/database"
+	"WeaveKnow/pkg/hash"
+	"WeaveKnow/pkg/log"
+	"WeaveKnow/pkg/token"
 	"context"
 	"errors"
 	"fmt"
-	"pai-smart-go/internal/model"
-	"pai-smart-go/internal/repository"
-	"pai-smart-go/pkg/database"
-	"pai-smart-go/pkg/hash"
-	"pai-smart-go/pkg/log"
-	"pai-smart-go/pkg/token"
 	"strings"
 	"time"
 

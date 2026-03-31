@@ -2,11 +2,11 @@
 package middleware
 
 import (
+	"WeaveKnow/internal/service"
+	"WeaveKnow/pkg/log"
+	"WeaveKnow/pkg/token"
 	"github.com/gin-gonic/gin"
 	"net/http"
-	"pai-smart-go/internal/service"
-	"pai-smart-go/pkg/log"
-	"pai-smart-go/pkg/token"
 	"strings"
 	"time"
 )

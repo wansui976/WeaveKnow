@@ -1,9 +1,9 @@
 package handler
 
 import (
+	"WeaveKnow/internal/model"
+	"WeaveKnow/internal/service"
 	"net/http"
-	"pai-smart-go/internal/model"
-	"pai-smart-go/internal/service"
 	"strconv"
 	"strings"
 

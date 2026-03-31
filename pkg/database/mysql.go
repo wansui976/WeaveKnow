@@ -1,9 +1,9 @@
 package database
 
 import (
+	"WeaveKnow/pkg/log"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
-	"pai-smart-go/pkg/log"
 	"time"
 )
 
