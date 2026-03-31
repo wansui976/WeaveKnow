@@ -106,11 +106,11 @@ func (s *EnhancedAgentService) Run(ctx context.Context, query string, user *mode
 	}
 	messages = append(messages, llm.Message{Role: "user", Content: query})
 
-	// 3. 智能选择工具（基于置信度评分）
+	// 3. 获取所有工具，让 AI 自主决策使用哪些
 	llmMessages := convertToLLMMessages(messages)
-	selectedTools := s.toolRegistry.SelectTools(query, llmMessages, 6)
+	allTools := s.toolRegistry.GetAllDefinitions()
 
-	log.Infof("[EnhancedAgentService] 为查询选择了 %d 个工具", len(selectedTools))
+	log.Infof("[EnhancedAgentService] 提供 %d 个工具供 AI 选择", len(allTools))
 
 	// 4. Agent 循环
 	for i := 0; i < s.maxIterations; i++ {
@@ -124,7 +124,7 @@ func (s *EnhancedAgentService) Run(ctx context.Context, query string, user *mode
 			}
 		}
 
-		result, err := s.llmClient.ChatWithTools(ctx, llmMessages, selectedTools, s.defaultGenParams)
+		result, err := s.llmClient.ChatWithTools(ctx, llmMessages, allTools, s.defaultGenParams)
 		if err != nil {
 			return fmt.Errorf("agent planning failed: %w", err)
 		}
