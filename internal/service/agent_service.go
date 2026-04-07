@@ -32,7 +32,7 @@ type AgentService interface {
 
 // AgentOptions 控制 Agent 循环与工具调用行为。
 type AgentOptions struct {
-	// MaxIterations 控制单次问答中“规划-调用工具”循环次数。
+	// MaxIterations 控制单次问答中"规划-调用工具"循环次数。
 	MaxIterations int
 	// DefaultTopK 是工具调用未显式给出 top_k 时的默认值。
 	DefaultTopK int
@@ -40,6 +40,8 @@ type AgentOptions struct {
 	ToolTimeout time.Duration
 	// ToolContextBudgetTokens 限制单次工具结果注入的预算（近似 token 数）。
 	ToolContextBudgetTokens int
+	// HistoryMaxTokens 限制历史消息注入的 token 预算，0 使用默认值 3000。
+	HistoryMaxTokens int
 }
 
 type agentService struct {
@@ -48,12 +50,14 @@ type agentService struct {
 	llmClient        llm.Client
 	conversationRepo repository.ConversationRepository
 	metricsService   MetricsService
+	memoryService    MemoryService
 
 	// 运行参数（构造时归一化，运行时只读）
 	maxIterations     int
 	defaultTopK       int
 	toolTimeout       time.Duration
 	toolContextBudget int
+	historyMaxTokens  int
 	defaultGenParams  *llm.GenerationParams
 	tools             []llm.Tool
 }
@@ -84,6 +88,7 @@ func NewAgentService(
 	llmClient llm.Client,
 	conversationRepo repository.ConversationRepository,
 	metricsService MetricsService,
+	memoryService MemoryService,
 	opts AgentOptions,
 ) AgentService {
 	maxIterations := opts.MaxIterations
@@ -108,15 +113,22 @@ func NewAgentService(
 		toolContextBudget = 1200
 	}
 
+	historyMaxTokens := opts.HistoryMaxTokens
+	if historyMaxTokens <= 0 {
+		historyMaxTokens = 3000
+	}
+
 	return &agentService{
 		searchService:     searchService,
 		llmClient:         llmClient,
 		conversationRepo:  conversationRepo,
 		metricsService:    metricsService,
+		memoryService:     memoryService,
 		maxIterations:     maxIterations,
 		defaultTopK:       defaultTopK,
 		toolTimeout:       toolTimeout,
 		toolContextBudget: toolContextBudget,
+		historyMaxTokens:  historyMaxTokens,
 		defaultGenParams:  buildGenerationParams(),
 		tools:             buildDefaultAgentTools(defaultTopK),
 	}
@@ -138,10 +150,15 @@ func (s *agentService) Run(ctx context.Context, query string, user *model.User, 
 		log.Errorf("[AgentService] 加载历史失败: %v", err)
 		history = []model.ChatMessage{}
 	}
+	// 按 token 预算截断历史，防止超出上下文窗口。
+	history = truncateHistoryMessages(history, s.historyMaxTokens)
+
+	// 1.5 检索用户记忆，注入 system prompt。
+	memoryText := s.buildMemoryContext(ctx, user.ID, query)
 
 	// 2. 组装 messages：system + history + 当前用户问题。
 	messages := make([]llm.Message, 0, len(history)+2+s.maxIterations*2)
-	messages = append(messages, llm.Message{Role: "system", Content: s.buildAgentSystemPrompt()})
+	messages = append(messages, llm.Message{Role: "system", Content: s.buildAgentSystemPrompt(memoryText)})
 	for _, h := range history {
 		messages = append(messages, llm.Message{Role: h.Role, Content: h.Content})
 	}
@@ -230,20 +247,8 @@ func (s *agentService) Run(ctx context.Context, query string, user *model.User, 
 	}
 
 	// 5. 最终流式回答阶段：基于完整上下文（含工具结果）输出答案。
-	messages = append(messages, llm.Message{
-		Role: "user",
-		Content: strings.TrimSpace(`
-现在只能直接输出给用户看的最终答案。
-
-严格禁止输出：
-- <think> 或任何思考内容
-- minimax:tool_call / tool_call / invoke / parameter 等工具标签
-- “让我重新检索”“让我继续检索”“让我基于检索结果回答”等过程性描述
-
-如果证据不足，直接回答“知识库中暂无相关信息”。
-`),
-	})
-
+	// 不再注入额外 user 消息，约束已内置于 system prompt；
+	// 同时不传 tools 参数，防止模型在最终阶段再次发起工具调用。
 	if err := sendProgressEvent(ws, "answering", "正在生成答案..."); err != nil {
 		log.Warnf("[AgentService] 发送 answering 进度失败: %v", err)
 	}
@@ -431,33 +436,26 @@ func (s *agentService) loadHistory(ctx context.Context, userID uint) ([]model.Ch
 	return s.conversationRepo.GetConversationHistory(ctx, convID)
 }
 
-// addMessageToConversation 将当前轮问答写回历史。
-// 说明：当前仍是“读-改-写”模式，后续可按仓储能力演进为 append-only 以降低并发覆盖风险。
+// addMessageToConversation 将当前轮问答原子追加到对话历史。
 func (s *agentService) addMessageToConversation(ctx context.Context, userID uint, question, answer string) error {
 	conversationID, err := s.conversationRepo.GetOrCreateConversationID(ctx, userID)
 	if err != nil {
 		return fmt.Errorf("failed to get or create conversation ID: %w", err)
 	}
-
-	history, err := s.conversationRepo.GetConversationHistory(ctx, conversationID)
-	if err != nil {
-		return fmt.Errorf("failed to get conversation history: %w", err)
-	}
-
 	now := time.Now()
-	history = append(history,
-		model.ChatMessage{Role: "user", Content: question, Timestamp: now},
-		model.ChatMessage{Role: "assistant", Content: answer, Timestamp: now},
-	)
-	return s.conversationRepo.UpdateConversationHistory(ctx, conversationID, history)
+	return s.conversationRepo.AppendMessages(ctx, conversationID, []model.ChatMessage{
+		{Role: "user", Content: question, Timestamp: now},
+		{Role: "assistant", Content: answer, Timestamp: now},
+	})
 }
 
-// buildAgentSystemPrompt 定义 Agent 行为边界，约束“先检索证据、再回答”。
-func (s *agentService) buildAgentSystemPrompt() string {
-	return strings.TrimSpace(`
+// buildAgentSystemPrompt 定义 Agent 行为边界，注入记忆上下文。
+func (s *agentService) buildAgentSystemPrompt(memoryText string) string {
+	var sb strings.Builder
+	sb.WriteString(strings.TrimSpace(`
 你是 WeaveKnow 知识库智能体。你的核心任务是通过检索外部知识库来解答用户问题。
 
-为了保证回答的准确性，你必须遵循“先分析、再检索、后回答”的流程，但分析过程只允许在内部完成：
+为了保证回答的准确性，你必须遵循"先分析、再检索、后回答"的流程，但分析过程只允许在内部完成：
 1. 先理解用户问题，判断是否需要调用工具。
 2. 需要证据时，优先调用 knowledge_search 检索知识库。
 3. 基于工具返回的事实继续分析，并给出最终答案。
@@ -466,10 +464,33 @@ func (s *agentService) buildAgentSystemPrompt() string {
 - 必须基于工具返回的事实进行回答，禁止凭空捏造。
 - 如果单次检索信息不完整，允许你变换关键词进行多次检索。
 - 在最终回答时，必须使用 [1][2] 等编号标注引用来源，编号需与工具返回的片段索引严格一致。
-- 如果尝试了所有相关查询仍无可用证据，请直接回答“知识库中暂无相关信息”。
-- 不要输出任何内部思考过程，不要输出 <think>、Thought、Action、Observation、tool_call 或 XML/Markdown 调试标签。
-- 最终回答必须直接面向用户，只输出结论、依据和必要的引用编号。
-`)
+- 如果尝试了所有相关查询仍无可用证据，请直接回答"知识库中暂无相关信息"。
+- 严格禁止输出 <think>、Thought、Action、Observation、tool_call 或任何内部调试标签。
+- 严格禁止输出"让我重新检索""让我继续检索"等过程性描述。
+- 最终回答必须直接面向用户，只输出结论、依据和必要的引用编号。`))
+	if memoryText != "" {
+		sb.WriteString("\n\n")
+		sb.WriteString(memoryText)
+	}
+	return sb.String()
+}
+
+// buildMemoryContext 检索用户记忆并返回可注入 prompt 的文本。
+func (s *agentService) buildMemoryContext(ctx context.Context, userID uint, query string) string {
+	if s.memoryService == nil {
+		return ""
+	}
+	memories, err := s.memoryService.Search(ctx, userID, SearchMemoryInput{
+		Workspace:  "default",
+		Categories: []string{"preferences", "project", "entities"},
+		Query:      query,
+		Limit:      5,
+	})
+	if err != nil {
+		log.Warnf("[AgentService] 检索用户记忆失败: %v", err)
+		return ""
+	}
+	return s.memoryService.BuildContext(memories)
 }
 
 func (s *agentService) previewToolCall(call llm.ToolCall) toolCallPreview {
@@ -504,7 +525,7 @@ func (s *agentService) previewToolCall(call llm.ToolCall) toolCallPreview {
 	return preview
 }
 
-// resolveToolContextBudgetTokens 估算“本轮可注入工具结果”的 token 预算。
+// resolveToolContextBudgetTokens 估算"本轮可注入工具结果"的 token 预算。
 //
 // 预算思路：
 // 1) 以模型上下文窗为总量（contextWindow）；
@@ -614,6 +635,7 @@ func resolveModelContextWindow() int {
 	}
 }
 
+// trimTextByTokenBudget 按 token 预算截断文本，优先在句子边界截断以保持语义完整。
 func trimTextByTokenBudget(text string, budgetTokens int) string {
 	text = strings.TrimSpace(text)
 	if text == "" || budgetTokens <= 0 {
@@ -622,6 +644,8 @@ func trimTextByTokenBudget(text string, budgetTokens int) string {
 	if estimateApproxTokens(text) <= budgetTokens {
 		return text
 	}
+
+	// 先按字符硬截断到预算内。
 	var b strings.Builder
 	used := 0.0
 	limit := float64(budgetTokens - 1) // 预留 "…" 预算
@@ -639,11 +663,24 @@ func trimTextByTokenBudget(text string, budgetTokens int) string {
 		used += cost
 		b.WriteRune(r)
 	}
-	out := strings.TrimSpace(b.String())
-	if out == "" {
+	raw := strings.TrimSpace(b.String())
+	if raw == "" {
 		return ""
 	}
-	return out + "…"
+
+	// 尝试在句子边界截断，优先中文句号，其次英文句点。
+	sentencePuncs := []string{"。", "！", "？", ".", "!", "?", "；", ";"}
+	bestIdx := -1
+	for _, p := range sentencePuncs {
+		if idx := strings.LastIndex(raw, p); idx > bestIdx {
+			bestIdx = idx + len(p)
+		}
+	}
+	// 仅当句边界截断保留了至少 40% 的内容时才采用，避免过度截短。
+	if bestIdx > len([]rune(raw))*2/5 {
+		return raw[:bestIdx] + "…"
+	}
+	return raw + "…"
 }
 
 func buildToolErrorResult(toolName string, err error) string {
@@ -676,6 +713,31 @@ func buildToolErrorResult(toolName string, err error) string {
 	}
 	b, _ := json.Marshal(payload)
 	return string(b)
+}
+
+// truncateHistoryMessages 按近似 token 预算保留最近历史，成对保留 user/assistant 消息。
+// 从最新消息向前累加，超出 budget 时停止，保证注入上下文不超出窗口限制。
+func truncateHistoryMessages(history []model.ChatMessage, budgetTokens int) []model.ChatMessage {
+	if len(history) == 0 || budgetTokens <= 0 {
+		return history
+	}
+	used := 0
+	cutIdx := len(history)
+	for i := len(history) - 1; i >= 0; i-- {
+		cost := estimateApproxTokens(history[i].Content) + 6
+		if used+cost > budgetTokens {
+			// 确保成对截断（不能只保留 assistant 而没有对应 user）。
+			cutIdx = i + 1
+			// 如果截断点正好落在 assistant 消息上，则再往后移一条，保证首条是 user。
+			if cutIdx < len(history) && history[cutIdx].Role == "assistant" {
+				cutIdx++
+			}
+			break
+		}
+		used += cost
+		cutIdx = i
+	}
+	return history[cutIdx:]
 }
 
 func buildDefaultAgentTools(defaultTopK int) []llm.Tool {

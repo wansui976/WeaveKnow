@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -97,8 +98,8 @@ func (t *KnowledgeSearchTool) Execute(ctx context.Context, args json.RawMessage,
 		return nil, fmt.Errorf("search failed: %w", err)
 	}
 
-	// 格式化结果
-	content := formatSearchResults(results)
+	// 格式化结果，使用 token 预算裁剪 snippet，防止工具结果撑爆上下文窗口。
+	content := formatSearchResultsWithBudget(results, deps.BudgetTokens)
 	sources := buildSourceItems(results)
 
 	message := fmt.Sprintf("已检索到 %d 条相关内容", len(results))
@@ -120,34 +121,92 @@ func (t *KnowledgeSearchTool) Execute(ctx context.Context, args json.RawMessage,
 	}, nil
 }
 
-func formatSearchResults(results []model.SearchResponseDTO) string {
-	if len(results) == 0 {
-		return `{"ok": true, "results": [], "total": 0}`
-	}
-
+// formatSearchResultsWithBudget 将检索结果序列化为 JSON，按 token 预算裁剪 snippet。
+// 与 agentService.formatKnowledgeSearchResult 逻辑一致：按 score 降序分配预算，
+// 每条 snippet 通过 trimTextByTokenBudget 在句子边界截断。
+// budgetTokens <= 0 时退化为不限制（使用完整 TextContent）。
+func formatSearchResultsWithBudget(results []model.SearchResponseDTO, budgetTokens int) string {
 	type item struct {
 		Index   int     `json:"index"`
+		FileMD5 string  `json:"file_md5"`
 		File    string  `json:"file_name"`
+		ChunkID int     `json:"chunk_id"`
 		Score   float64 `json:"score"`
 		Snippet string  `json:"snippet"`
 	}
+	type payload struct {
+		OK           bool   `json:"ok"`
+		BudgetTokens int    `json:"budget_tokens"`
+		Selected     int    `json:"selected"`
+		Total        int    `json:"total"`
+		Results      []item `json:"results"`
+	}
 
-	items := make([]item, len(results))
-	for i, r := range results {
-		items[i] = item{
-			Index:   i + 1,
-			File:    r.FileName,
-			Score:   r.Score,
-			Snippet: strings.TrimSpace(r.TextContent),
+	if len(results) == 0 {
+		b, _ := json.Marshal(payload{OK: true, BudgetTokens: budgetTokens, Results: []item{}})
+		return string(b)
+	}
+
+	// 无预算限制时直接全量返回，无需排序和裁剪。
+	if budgetTokens <= 0 {
+		items := make([]item, len(results))
+		for i, r := range results {
+			items[i] = item{
+				Index:   i + 1,
+				FileMD5: r.FileMD5,
+				File:    r.FileName,
+				ChunkID: r.ChunkID,
+				Score:   r.Score,
+				Snippet: strings.TrimSpace(r.TextContent),
+			}
 		}
+		b, _ := json.Marshal(payload{OK: true, BudgetTokens: 0, Selected: len(items), Total: len(results), Results: items})
+		return string(b)
 	}
 
-	payload := map[string]interface{}{
-		"ok":      true,
-		"total":   len(results),
-		"results": items,
+	// 按 score 降序排序，优先给高价值结果分配预算。
+	sorted := make([]model.SearchResponseDTO, len(results))
+	copy(sorted, results)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		return sorted[i].Score > sorted[j].Score
+	})
+
+	const (
+		baseOverheadTokens = 80
+		docOverheadTokens  = 35
+		minSnippetTokens   = 40
+		maxSnippetTokens   = 220
+	)
+	usedTokens := baseOverheadTokens
+	selected := make([]item, 0, len(sorted))
+	for i, r := range sorted {
+		remainingBudget := budgetTokens - usedTokens
+		if remainingBudget <= docOverheadTokens+minSnippetTokens {
+			break
+		}
+		remainingDocs := len(sorted) - i
+		targetSnippetTokens := (remainingBudget/remainingDocs) - docOverheadTokens
+		if targetSnippetTokens < minSnippetTokens {
+			targetSnippetTokens = minSnippetTokens
+		}
+		if targetSnippetTokens > maxSnippetTokens {
+			targetSnippetTokens = maxSnippetTokens
+		}
+		snippet := trimTextByTokenBudget(strings.TrimSpace(r.TextContent), targetSnippetTokens)
+		if snippet == "" {
+			continue
+		}
+		usedTokens += docOverheadTokens + estimateApproxTokens(snippet)
+		selected = append(selected, item{
+			Index:   i + 1,
+			FileMD5: r.FileMD5,
+			File:    r.FileName,
+			ChunkID: r.ChunkID,
+			Score:   r.Score,
+			Snippet: snippet,
+		})
 	}
 
-	b, _ := json.Marshal(payload)
+	b, _ := json.Marshal(payload{OK: true, BudgetTokens: budgetTokens, Selected: len(selected), Total: len(results), Results: selected})
 	return string(b)
 }

@@ -54,7 +54,7 @@ type chatService struct {
 	promptRules string
 	// noResultText 在检索无结果时写入 REF 区域，提示模型当前轮无外部文档上下文。
 	noResultText string
-	// refStart / refEnd 用于包裹“检索参考片段”边界，方便模型识别可引用范围。
+	// refStart / refEnd 用于包裹"检索参考片段"边界，方便模型识别可引用范围。
 	refStart string
 	refEnd   string
 
@@ -101,7 +101,7 @@ func (s *chatService) StreamResponse(ctx context.Context, query string, user *mo
 		log.Warnf("[ChatService] 发送 planning 进度失败: %v", err)
 	}
 
-	// 1. 先加载历史，再进行“多轮问题融合”后检索。
+	// 1. 先加载历史，再进行"多轮问题融合"后检索。
 	history, err := s.loadHistory(ctx, user.ID)
 	if err != nil {
 		log.Errorf("[ChatService] 加载对话历史失败: %v", err)
@@ -141,7 +141,7 @@ func (s *chatService) StreamResponse(ctx context.Context, query string, user *mo
 			log.Warnf("[ChatService] 发送空结果提示失败: %v", sendErr)
 		}
 	} else {
-		// 检索命中时先推送结构化 sources，前端可直接渲染“可点击来源”。
+		// 检索命中时先推送结构化 sources，前端可直接渲染"可点击来源"。
 		if sendErr := sendSources(ws, buildSourceItems(results)); sendErr != nil {
 			log.Warnf("[ChatService] 发送 sources 失败: %v", sendErr)
 		}
@@ -293,7 +293,7 @@ func (s *chatService) asyncUpdateMemory(userID uint, question string, answer str
 		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutS)*time.Second)
 		defer cancel()
 
-		// 让模型以“纯 JSON 数组”输出，降低解析复杂度与歧义。
+		// 让模型以"纯 JSON 数组"输出，降低解析复杂度与歧义。
 		messages := []llm.Message{
 			{
 				Role: "system",
@@ -342,7 +342,7 @@ func (s *chatService) asyncUpdateMemory(userID uint, question string, answer str
 	}()
 }
 
-// buildRetrievalQuery 基于最近对话做“多轮问题融合”，用于检索阶段（不会替换用户原始提问）。
+// buildRetrievalQuery 基于最近对话做"多轮问题融合"，用于检索阶段（不会替换用户原始提问）。
 func (s *chatService) buildRetrievalQuery(query string, history []model.ChatMessage) string {
 	trimmed := strings.TrimSpace(query)
 	if trimmed == "" || len(history) == 0 {
@@ -403,7 +403,7 @@ func isLikelyFollowupQuery(query string) bool {
 }
 
 // collectRecentHistoryLines 提取最近 maxTurns 轮 user/assistant 历史，并按时间正序返回。
-// 返回行格式为“用户: ...”或“助手: ...”，用于构建检索融合上下文。
+// 返回行格式为"用户: ..."或"助手: ..."，用于构建检索融合上下文。
 func collectRecentHistoryLines(history []model.ChatMessage, maxTurns int) []string {
 	// 至少保留 1 轮，避免传入非法值导致完全不取历史。
 	if maxTurns <= 0 {
@@ -437,7 +437,7 @@ func collectRecentHistoryLines(history []model.ChatMessage, maxTurns int) []stri
 	if len(reversed) == 0 {
 		return nil
 	}
-	// reversed 当前为“新 -> 旧”，翻转为“旧 -> 新”后返回。
+	// reversed 当前为"新 -> 旧"，翻转为"旧 -> 新"后返回。
 	lines := make([]string, 0, len(reversed))
 	for i := len(reversed) - 1; i >= 0; i-- {
 		lines = append(lines, reversed[i])
@@ -500,29 +500,17 @@ func (s *chatService) composeMessages(systemMsg string, history []model.ChatMess
 	return msgs
 }
 
-// addMessageToConversation 将本轮 Q&A 追加到对话历史。
-//
-// 若底层 Repository 支持 AppendMessages，应优先使用 Append-only 接口
-// 以避免"读-改-写"模式在并发下覆盖其他请求写入的消息。
-// 当前实现保持与原接口兼容，但标注了改造方向。
+// addMessageToConversation 将本轮 Q&A 原子追加到对话历史。
 func (s *chatService) addMessageToConversation(ctx context.Context, userID uint, question, answer string) error {
 	conversationID, err := s.conversationRepo.GetOrCreateConversationID(ctx, userID)
 	if err != nil {
 		return fmt.Errorf("failed to get or create conversation ID: %w", err)
 	}
-
-	history, err := s.conversationRepo.GetConversationHistory(ctx, conversationID)
-	if err != nil {
-		return fmt.Errorf("failed to get conversation history: %w", err)
-	}
-
 	now := time.Now()
-	history = append(history,
-		model.ChatMessage{Role: "user", Content: question, Timestamp: now},
-		model.ChatMessage{Role: "assistant", Content: answer, Timestamp: now},
-	)
-
-	return s.conversationRepo.UpdateConversationHistory(ctx, conversationID, history)
+	return s.conversationRepo.AppendMessages(ctx, conversationID, []model.ChatMessage{
+		{Role: "user", Content: question, Timestamp: now},
+		{Role: "assistant", Content: answer, Timestamp: now},
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -681,7 +669,7 @@ func sendWarningChunk(ws llm.MessageWriter, msg string) error {
 	return writeWSJSON(ws, payload)
 }
 
-// sendSources 向前端发送结构化来源列表，便于做“可点击来源”渲染。
+// sendSources 向前端发送结构化来源列表，便于做"可点击来源"渲染。
 func sendSources(ws llm.MessageWriter, sources []sourceItem) error {
 	if len(sources) == 0 {
 		return nil

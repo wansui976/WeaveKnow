@@ -4,6 +4,8 @@ import (
 	"WeaveKnow/internal/config"
 	"WeaveKnow/internal/model"
 	"WeaveKnow/internal/repository"
+	"WeaveKnow/pkg/embedding"
+	"WeaveKnow/pkg/es"
 	"WeaveKnow/pkg/log"
 	"context"
 	"crypto/md5"
@@ -79,13 +81,14 @@ type MemoryService interface {
 
 // memoryService 是 MemoryService 的默认实现。
 type memoryService struct {
-	repo repository.MemoryRepository
-	cfg  config.MemoryConfig
+	repo            repository.MemoryRepository
+	cfg             config.MemoryConfig
+	embeddingClient embedding.Client
 }
 
 // NewMemoryService 创建 MemoryService。
-func NewMemoryService(repo repository.MemoryRepository, cfg config.MemoryConfig) MemoryService {
-	return &memoryService{repo: repo, cfg: cfg}
+func NewMemoryService(repo repository.MemoryRepository, cfg config.MemoryConfig, embeddingClient embedding.Client) MemoryService {
+	return &memoryService{repo: repo, cfg: cfg, embeddingClient: embeddingClient}
 }
 
 // Upsert 对单条记忆做标准化、校验与幂等写入。
@@ -144,17 +147,44 @@ func (s *memoryService) Upsert(ctx context.Context, userID uint, input UpsertMem
 	if err := s.repo.UpsertByHash(ctx, entry); err != nil {
 		return nil, err
 	}
+
+	if s.embeddingClient != nil {
+		vec, err := s.embeddingClient.CreateEmbedding(ctx, content)
+		if err != nil {
+			log.Warnf("[MemoryService] 生成记忆向量失败: %v", err)
+		} else {
+			entry.ContentVec = vec
+			if updateErr := s.repo.UpdateContentVector(ctx, entry.ID, vec); updateErr != nil {
+				log.Warnf("[MemoryService] 更新记忆向量到数据库失败: %v", updateErr)
+			}
+			memDoc := model.MemoryEsDocument{
+				MemoryID:   entry.ID,
+				UserID:     entry.UserID,
+				Workspace:  entry.Workspace,
+				Category:   entry.Category,
+				Content:    entry.Content,
+				Keywords:   entry.Keywords,
+				Confidence: entry.Confidence,
+				Vector:     vec,
+				UpdatedAt:  entry.UpdatedAt.Unix(),
+			}
+			if indexErr := es.IndexMemoryVector(ctx, memDoc); indexErr != nil {
+				log.Warnf("[MemoryService] 索引记忆向量到ES失败: %v", indexErr)
+			}
+		}
+	}
+
 	return entry, nil
 }
 
 // Search 按用户维度检索记忆，并做输入清洗与限流控制。
+// 采用混合检索策略：向量 kNN 检索 + 关键词 BM25 检索，使用 RRF 融合。
 func (s *memoryService) Search(ctx context.Context, userID uint, input SearchMemoryInput) ([]model.MemoryEntry, error) {
 	workspace := normalizeWorkspace(input.Workspace)
 	if err := validateWorkspace(workspace); err != nil {
 		return nil, err
 	}
 
-	// 分类过滤器：仅保留合法分类，非法项直接跳过（不整体报错）。
 	categories := make([]string, 0, len(input.Categories))
 	for _, c := range input.Categories {
 		nc, err := normalizeCategory(c)
@@ -164,11 +194,9 @@ func (s *memoryService) Search(ctx context.Context, userID uint, input SearchMem
 		categories = append(categories, nc)
 	}
 
-	// query 做轻量压缩，减少“当前问题/相关上下文”前缀噪声。
 	query := strings.TrimSpace(input.Query)
 	query = compactMemoryQuery(query)
 
-	// 限制返回条数，防止一次拉取过多影响性能。
 	limit := input.Limit
 	if limit <= 0 {
 		limit = 5
@@ -184,28 +212,167 @@ func (s *memoryService) Search(ctx context.Context, userID uint, input SearchMem
 		fetchLimit = 80
 	}
 
+	if s.embeddingClient != nil && query != "" {
+		return s.hybridSearch(ctx, userID, workspace, categories, query, limit, fetchLimit)
+	}
+
 	candidates, err := s.repo.Search(ctx, userID, workspace, categories, query, fetchLimit)
 	if err != nil {
 		return nil, err
 	}
 
 	ranked := s.applyDecayAndRank(candidates, limit)
-	if len(ranked) > 0 {
-		ids := make([]uint, 0, len(ranked))
-		for _, item := range ranked {
-			ids = append(ids, item.ID)
-		}
-		boost := s.cfg.HitBoost
-		if boost == 0 {
-			boost = 0.02
-		}
-		go func(ids []uint, delta float64) {
-			if err := s.repo.BoostConfidence(context.Background(), ids, delta); err != nil {
-				log.Warnf("[MemoryService] 提升命中记忆置信度失败: %v", err)
-			}
-		}(ids, boost)
-	}
+	s.updateHitBoost(ranked)
 	return ranked, nil
+}
+
+func (s *memoryService) hybridSearch(ctx context.Context, userID uint, workspace string, categories []string, query string, limit int, fetchLimit int) ([]model.MemoryEntry, error) {
+	queryVector, err := s.embeddingClient.CreateEmbedding(ctx, query)
+	if err != nil {
+		log.Warnf("[MemoryService] 生成查询向量失败，回退到关键词检索: %v", err)
+		candidates, err := s.repo.Search(ctx, userID, workspace, categories, query, fetchLimit)
+		if err != nil {
+			return nil, err
+		}
+		ranked := s.applyDecayAndRank(candidates, limit)
+		s.updateHitBoost(ranked)
+		return ranked, nil
+	}
+
+	knnResults, err := es.SearchMemoryVectors(ctx, queryVector, userID, workspace, categories, fetchLimit)
+	if err != nil {
+		log.Warnf("[MemoryService] 向量检索失败，回退到关键词检索: %v", err)
+		candidates, err := s.repo.Search(ctx, userID, workspace, categories, query, fetchLimit)
+		if err != nil {
+			return nil, err
+		}
+		ranked := s.applyDecayAndRank(candidates, limit)
+		s.updateHitBoost(ranked)
+		return ranked, nil
+	}
+
+	bm25Candidates, err := s.repo.Search(ctx, userID, workspace, categories, query, fetchLimit)
+	if err != nil {
+		log.Warnf("[MemoryService] 关键词检索失败: %v", err)
+		return s.knnResultsToMemoryEntries(ctx, knnResults, limit)
+	}
+
+	fused := s.fuseResults(knnResults, bm25Candidates, limit)
+	ranked := s.applyDecayAndRank(fused, limit)
+	s.updateHitBoost(ranked)
+	return ranked, nil
+}
+
+func (s *memoryService) knnResultsToMemoryEntries(ctx context.Context, knnResults []es.MemorySearchResult, limit int) ([]model.MemoryEntry, error) {
+	if len(knnResults) == 0 {
+		return []model.MemoryEntry{}, nil
+	}
+	ids := make([]uint, 0, len(knnResults))
+	for _, r := range knnResults {
+		ids = append(ids, r.MemoryID)
+	}
+	entries, err := s.repo.GetByIDs(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	entryMap := make(map[uint]model.MemoryEntry, len(entries))
+	for _, e := range entries {
+		entryMap[e.ID] = e
+	}
+	result := make([]model.MemoryEntry, 0, len(knnResults))
+	for _, r := range knnResults {
+		if e, ok := entryMap[r.MemoryID]; ok {
+			result = append(result, e)
+			if len(result) >= limit {
+				break
+			}
+		}
+	}
+	return result, nil
+}
+
+const rrfConstant = 60
+
+func (s *memoryService) fuseResults(knnResults []es.MemorySearchResult, bm25Candidates []model.MemoryEntry, limit int) []model.MemoryEntry {
+	type scoredEntry struct {
+		entry model.MemoryEntry
+		score float64
+	}
+
+	knnRank := make(map[uint]int)
+	for i, r := range knnResults {
+		knnRank[r.MemoryID] = i + 1
+	}
+
+	bm25Rank := make(map[uint]int)
+	for i, e := range bm25Candidates {
+		bm25Rank[e.ID] = i + 1
+	}
+
+	bm25Map := make(map[uint]model.MemoryEntry)
+	for _, e := range bm25Candidates {
+		bm25Map[e.ID] = e
+	}
+
+	allIDs := make(map[uint]bool)
+	for _, r := range knnResults {
+		allIDs[r.MemoryID] = true
+	}
+	for _, e := range bm25Candidates {
+		allIDs[e.ID] = true
+	}
+
+	scored := make([]scoredEntry, 0, len(allIDs))
+	for id := range allIDs {
+		entry, ok := bm25Map[id]
+		if !ok {
+			continue
+		}
+		knnPos := knnRank[id]
+		bm25Pos := bm25Rank[id]
+
+		var rrfScore float64
+		if knnPos > 0 {
+			rrfScore += 1.0 / (rrfConstant + float64(knnPos))
+		}
+		if bm25Pos > 0 {
+			rrfScore += 1.0 / (rrfConstant + float64(bm25Pos))
+		}
+
+		scored = append(scored, scoredEntry{entry: entry, score: rrfScore})
+	}
+
+	sort.SliceStable(scored, func(i, j int) bool {
+		return scored[i].score > scored[j].score
+	})
+
+	result := make([]model.MemoryEntry, 0, limit)
+	for _, se := range scored {
+		result = append(result, se.entry)
+		if len(result) >= limit {
+			break
+		}
+	}
+	return result
+}
+
+func (s *memoryService) updateHitBoost(ranked []model.MemoryEntry) {
+	if len(ranked) == 0 {
+		return
+	}
+	ids := make([]uint, 0, len(ranked))
+	for _, item := range ranked {
+		ids = append(ids, item.ID)
+	}
+	boost := s.cfg.HitBoost
+	if boost == 0 {
+		boost = 0.02
+	}
+	go func(ids []uint, delta float64) {
+		if err := s.repo.BoostConfidence(context.Background(), ids, delta); err != nil {
+			log.Warnf("[MemoryService] 提升命中记忆置信度失败: %v", err)
+		}
+	}(ids, boost)
 }
 
 // ListByCategory 列举指定用户在某 workspace/category 下的记忆。

@@ -140,7 +140,7 @@ func (s *searchService) HybridSearch(ctx context.Context, query string, topK int
 	}
 	log.Infof("[SearchService] 步骤2: 向量化成功, 向量维度: %d", len(queryVector))
 
-	// 4) 在 ES 8.10 兼容模式下执行“两路召回 + Go 内存 RRF 融合”。
+	// 4) 在 ES 8.10 兼容模式下执行"两路召回 + Go 内存 RRF 融合"。
 	//    不使用较新版本才支持的 retriever/rrf DSL，避免 8.10.4 报错。
 	log.Info("[SearchService] 步骤3: 执行双路召回并在本地做 RRF 融合")
 	recallTopK := s.resolveRecallTopK(topK)
@@ -527,7 +527,7 @@ func (s *searchService) buildResultCacheKey(
 
 	// 默认使用改写后的查询文本作为查询签名。
 	queryKey := strings.ToLower(strings.TrimSpace(rewrittenQuery))
-	// 启用“相似查询共用缓存”时，优先使用 normalized/phrase 作为语义键。
+	// 启用"相似查询共用缓存"时，优先使用 normalized/phrase 作为语义键。
 	if s.searchCfg.ResultCacheSimilarityEnabled {
 		parts := make([]string, 0, 2)
 		if normalized != "" {
@@ -555,10 +555,17 @@ func (s *searchService) buildResultCacheKey(
 		}
 	}
 
+	// 将 embedding 模型与维度纳入签名，防止更换模型后旧缓存被复用。
+	embeddingModelSig := fmt.Sprintf("%s:%d",
+		strings.TrimSpace(config.Conf.Embedding.Model),
+		config.Conf.Embedding.Dimensions,
+	)
+
 	// 统一缓存键格式；长文本字段使用 shortHash 控制长度并提升可读性。
 	return fmt.Sprintf(
-		"search:result:v1:%s:u%d:o%s:q%s:k%d:r%s",
+		"search:result:v2:%s:e%s:u%d:o%s:q%s:k%d:r%s",
 		s.indexName,
+		shortHash(embeddingModelSig),
 		user.ID,
 		shortHash(scopeSig),
 		shortHash(queryKey),
@@ -890,7 +897,7 @@ func rerankSearchResults(query string, docs []model.SearchResponseDTO, topK int)
 	if len(docs) == 0 {
 		return docs
 	}
-	// topK 兜底：<=0 视为“返回全部”；>len(docs) 时截到上限。
+	// topK 兜底：<=0 视为"返回全部"；>len(docs) 时截到上限。
 	if topK <= 0 {
 		topK = len(docs)
 	}
@@ -975,22 +982,55 @@ func splitQueryTokens(q string) []string {
 	return tokens
 }
 
+// buildBigrams 对文本提取字符级 bigram 集合，用于中文文本的词项重叠计算。
+// 示例："知识库" -> {"知识", "识库"}
+func buildBigrams(text string) map[string]struct{} {
+	runes := []rune(text)
+	if len(runes) < 2 {
+		if len(runes) == 1 {
+			return map[string]struct{}{string(runes): {}}
+		}
+		return nil
+	}
+	bg := make(map[string]struct{}, len(runes)-1)
+	for i := 0; i < len(runes)-1; i++ {
+		bg[string(runes[i:i+2])] = struct{}{}
+	}
+	return bg
+}
+
+// tokenOverlapScore 融合空格 token 匹配（英文/数字）与 bigram 覆盖率（中文），
+// 取两者均值作为词项重叠得分，解决按空格分词对中文无效的问题。
 func tokenOverlapScore(tokens []string, text string) float64 {
 	if len(tokens) == 0 || text == "" {
 		return 0
 	}
-	hit := 0
+
+	// 空格 token 匹配（对英文/数字有效）。
+	tokenHit := 0
 	for _, tk := range tokens {
 		if strings.Contains(text, tk) {
-			hit++
+			tokenHit++
 		}
 	}
-	return float64(hit) / float64(len(tokens))
-}
+	tokenScore := float64(tokenHit) / float64(len(tokens))
 
-func normalizeSemanticScore(score float64) float64 {
-	// logistic 压缩到 0~1，兼容 BM25/RRF 不同尺度。
-	return 1.0 / (1.0 + math.Exp(-score))
+	// bigram 覆盖率（对中文有效）：query bigram 中有多少出现在 text 中。
+	queryBigrams := buildBigrams(strings.ToLower(strings.Join(tokens, "")))
+	if len(queryBigrams) == 0 {
+		return tokenScore
+	}
+	textLower := strings.ToLower(text)
+	bigramHit := 0
+	for bg := range queryBigrams {
+		if strings.Contains(textLower, bg) {
+			bigramHit++
+		}
+	}
+	bigramScore := float64(bigramHit) / float64(len(queryBigrams))
+
+	// 取均值融合两种信号。
+	return (tokenScore + bigramScore) / 2.0
 }
 
 // rewriteQueryIfEnabled 在 HybridSearch 前执行可选的 Query Rewriting。
@@ -1057,9 +1097,9 @@ func sanitizeRewrittenQuery(raw string, maxLength int) string {
 		if line == "" {
 			continue
 		}
-		line = strings.Trim(line, "`\"'“”‘’ ")
+		line = strings.Trim(line, "`\"’\u2018\u2019\u201C\u201D ")
 		line = stripRewritePrefix(line)
-		line = strings.Trim(line, "`\"'“”‘’ ")
+		line = strings.Trim(line, "`\"’\u2018\u2019\u201C\u201D ")
 		if line != "" {
 			cleaned = line
 			break

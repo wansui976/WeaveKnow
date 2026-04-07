@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"time"
@@ -19,12 +20,14 @@ type EnhancedAgentService struct {
 	llmClient        llm.Client
 	conversationRepo repository.ConversationRepository
 	metricsService   MetricsService
+	memoryService    MemoryService
 	toolRegistry     *ToolRegistry
 
 	maxIterations     int
 	defaultTopK       int
 	toolTimeout       time.Duration
 	toolContextBudget int
+	historyMaxTokens  int
 	defaultGenParams  *llm.GenerationParams
 	enableParallel    bool
 }
@@ -35,6 +38,7 @@ func NewEnhancedAgentService(
 	llmClient llm.Client,
 	conversationRepo repository.ConversationRepository,
 	metricsService MetricsService,
+	memoryService MemoryService,
 	opts AgentOptions,
 ) AgentService {
 	maxIterations := opts.MaxIterations
@@ -60,6 +64,11 @@ func NewEnhancedAgentService(
 		toolContextBudget = 1200
 	}
 
+	historyMaxTokens := opts.HistoryMaxTokens
+	if historyMaxTokens <= 0 {
+		historyMaxTokens = 3000
+	}
+
 	// 创建工具注册表并注册所有工具
 	registry := NewToolRegistry()
 	registry.Register("knowledge_search", NewKnowledgeSearchTool(defaultTopK))
@@ -72,13 +81,15 @@ func NewEnhancedAgentService(
 		llmClient:         llmClient,
 		conversationRepo:  conversationRepo,
 		metricsService:    metricsService,
+		memoryService:     memoryService,
 		toolRegistry:      registry,
 		maxIterations:     maxIterations,
 		defaultTopK:       defaultTopK,
 		toolTimeout:       toolTimeout,
 		toolContextBudget: toolContextBudget,
+		historyMaxTokens:  historyMaxTokens,
 		defaultGenParams:  buildGenerationParams(),
-		enableParallel:    true, // 默认启用并行执行
+		enableParallel:    true,
 	}
 }
 
@@ -97,10 +108,15 @@ func (s *EnhancedAgentService) Run(ctx context.Context, query string, user *mode
 		log.Errorf("[EnhancedAgentService] 加载历史失败: %v", err)
 		history = []model.ChatMessage{}
 	}
+	// 按 token 预算截断历史。
+	history = truncateHistoryMessages(history, s.historyMaxTokens)
+
+	// 1.5 检索用户记忆，注入 system prompt。
+	memoryText := s.buildMemoryContext(ctx, user.ID, query)
 
 	// 2. 组装 messages
 	messages := make([]llm.Message, 0, len(history)+2+s.maxIterations*4)
-	messages = append(messages, llm.Message{Role: "system", Content: s.buildEnhancedSystemPrompt()})
+	messages = append(messages, llm.Message{Role: "system", Content: s.buildEnhancedSystemPrompt(memoryText)})
 	for _, h := range history {
 		messages = append(messages, llm.Message{Role: h.Role, Content: h.Content})
 	}
@@ -145,8 +161,8 @@ func (s *EnhancedAgentService) Run(ctx context.Context, query string, user *mode
 			ToolCalls: result.ToolCalls,
 		})
 
-		// 5. 执行工具调用（支持并行）
-		toolResults := s.executeToolCalls(ctx, result.ToolCalls, user, ws)
+		// 5. 执行工具调用（支持并行），传入当前 messages 用于 token 预算计算。
+		toolResults := s.executeToolCalls(ctx, result.ToolCalls, llmMessages, user, ws)
 
 		// 6. 将工具结果添加到上下文
 		for _, call := range result.ToolCalls {
@@ -165,34 +181,7 @@ func (s *EnhancedAgentService) Run(ctx context.Context, query string, user *mode
 		}
 	}
 
-	// 7. 最终流式回答
-	messages = append(messages, llm.Message{
-		Role: "user",
-		Content: strings.TrimSpace(`
-现在只能直接输出给用户看的最终答案。
-
-严格禁止输出：
-- <think> 或任何思考内容
-- tool_call / invoke / parameter 等工具标签
-- "让我重新检索"等过程性描述
-
-如果证据不足，直接回答"知识库中暂无相关信息"。
-`),
-	})
-	llmMessages = append(llmMessages, llm.Message{
-		Role: "user",
-		Content: strings.TrimSpace(`
-现在只能直接输出给用户看的最终答案。
-
-严格禁止输出：
-- <think> 或任何思考内容
-- tool_call / invoke / parameter 等工具标签
-- "让我重新检索"等过程性描述
-
-如果证据不足，直接回答"知识库中暂无相关信息"。
-`),
-	})
-
+	// 7. 最终流式回答：约束已内置于 system prompt，不再注入额外 user 消息。
 	if err := sendProgressEvent(ws, "answering", "正在生成答案..."); err != nil {
 		log.Warnf("[EnhancedAgentService] 发送 answering 进度失败: %v", err)
 	}
@@ -222,17 +211,21 @@ func (s *EnhancedAgentService) Run(ctx context.Context, query string, user *mode
 }
 
 // executeToolCalls 执行工具调用，支持并行和串行模式。
+// messages 用于计算当前上下文已占用 token，从而确定本次可注入工具结果的预算。
 func (s *EnhancedAgentService) executeToolCalls(
 	ctx context.Context,
 	calls []llm.ToolCall,
+	messages []llm.Message,
 	user *model.User,
 	ws llm.MessageWriter,
 ) map[string]*ToolResult {
+
 	deps := &ToolDependencies{
 		SearchService: s.searchService,
 		LLMClient:     s.llmClient,
 		User:          user,
 		Timeout:       s.toolTimeout,
+		BudgetTokens:  s.resolveToolContextBudgetTokens(messages),
 	}
 
 	// 判断是否可以并行执行
@@ -429,22 +422,34 @@ func (s *EnhancedAgentService) addMessageToConversation(ctx context.Context, use
 	if err != nil {
 		return fmt.Errorf("failed to get or create conversation ID: %w", err)
 	}
-
-	history, err := s.conversationRepo.GetConversationHistory(ctx, conversationID)
-	if err != nil {
-		return fmt.Errorf("failed to get conversation history: %w", err)
-	}
-
 	now := time.Now()
-	history = append(history,
-		model.ChatMessage{Role: "user", Content: question, Timestamp: now},
-		model.ChatMessage{Role: "assistant", Content: answer, Timestamp: now},
-	)
-	return s.conversationRepo.UpdateConversationHistory(ctx, conversationID, history)
+	return s.conversationRepo.AppendMessages(ctx, conversationID, []model.ChatMessage{
+		{Role: "user", Content: question, Timestamp: now},
+		{Role: "assistant", Content: answer, Timestamp: now},
+	})
 }
 
-func (s *EnhancedAgentService) buildEnhancedSystemPrompt() string {
-	return strings.TrimSpace(`
+// buildMemoryContext 检索用户记忆并返回可注入 prompt 的文本。
+func (s *EnhancedAgentService) buildMemoryContext(ctx context.Context, userID uint, query string) string {
+	if s.memoryService == nil {
+		return ""
+	}
+	memories, err := s.memoryService.Search(ctx, userID, SearchMemoryInput{
+		Workspace:  "default",
+		Categories: []string{"preferences", "project", "entities"},
+		Query:      query,
+		Limit:      5,
+	})
+	if err != nil {
+		log.Warnf("[EnhancedAgentService] 检索用户记忆失败: %v", err)
+		return ""
+	}
+	return s.memoryService.BuildContext(memories)
+}
+
+func (s *EnhancedAgentService) buildEnhancedSystemPrompt(memoryText string) string {
+	var sb strings.Builder
+	sb.WriteString(strings.TrimSpace(`
 你是 WeaveKnow 知识库智能体。你拥有多种工具来帮助用户解答问题。
 
 可用工具：
@@ -463,11 +468,40 @@ func (s *EnhancedAgentService) buildEnhancedSystemPrompt() string {
 - 必须基于工具返回的事实进行回答，禁止凭空捏造
 - 在最终回答时使用 [1][2] 等编号标注引用来源
 - 如果尝试了所有相关查询仍无可用证据，直接回答"知识库中暂无相关信息"
-- 不要输出内部思考过程、工具调用标签或调试信息
-- 最终回答必须直接面向用户，清晰简洁
-`)
+- 严格禁止输出 <think>、tool_call、invoke 或任何内部调试标签
+- 严格禁止输出"让我重新检索"等过程性描述
+- 最终回答必须直接面向用户，清晰简洁`))
+	if memoryText != "" {
+		sb.WriteString("\n\n")
+		sb.WriteString(memoryText)
+	}
+	return sb.String()
 }
 
 func convertToLLMMessages(messages []llm.Message) []llm.Message {
 	return messages
+}
+
+// resolveToolContextBudgetTokens 估算本轮可注入工具结果的 token 预算，与 agentService 逻辑一致。
+func (s *EnhancedAgentService) resolveToolContextBudgetTokens(messages []llm.Message) int {
+	contextWindow := resolveModelContextWindow()
+	usedTokens := estimateMessagesTokens(messages)
+	reservedOutput := resolveReservedOutputTokens(contextWindow, s.defaultGenParams)
+	safetyMargin := int(math.Max(256, float64(contextWindow)*0.08))
+
+	remaining := contextWindow - usedTokens - reservedOutput - safetyMargin
+	if remaining < 120 {
+		remaining = 120
+	}
+	if s.toolContextBudget > 0 && remaining > s.toolContextBudget {
+		remaining = s.toolContextBudget
+	}
+	maxByWindow := contextWindow / 3
+	if maxByWindow < 120 {
+		maxByWindow = 120
+	}
+	if remaining > maxByWindow {
+		remaining = maxByWindow
+	}
+	return remaining
 }

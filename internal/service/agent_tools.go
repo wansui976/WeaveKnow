@@ -35,6 +35,8 @@ type ToolDependencies struct {
 	LLMClient     llm.Client
 	User          *model.User
 	Timeout       time.Duration
+	// BudgetTokens 是本次工具结果可注入的近似 token 预算，0 表示不限制。
+	BudgetTokens int
 }
 
 // ToolResult 封装工具执行结果。
